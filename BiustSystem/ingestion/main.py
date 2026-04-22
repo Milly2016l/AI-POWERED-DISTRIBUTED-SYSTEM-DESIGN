@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from datetime import datetime
-from models import Metrics
-from producer import send_to_kafka
+from BiustSystem.ingestion.models import Metrics
+from BiustSystem.ingestion.producer import send_to_kafka
 
 app = FastAPI()
 

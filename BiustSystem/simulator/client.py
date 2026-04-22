@@ -4,16 +4,21 @@ import time
 
 URL = "http://127.0.0.1:8000/metrics"
 
+print("Simulator running... sending metrics every second")
+
 while True:
     data = {
-        "server_id": f"node-{random.randint(1,5)}",
-        "cpu_usage": random.uniform(20, 95),
-        "memory_usage": random.uniform(30, 90),
+        "server_id": f"node-{random.randint(1, 5)}",
+        "cpu": random.randint(20, 95),
+        "memory": random.randint(30, 90),
         "requests": random.randint(100, 2000),
-        "latency": random.uniform(50, 300)
+        "latency": random.randint(50, 300)
     }
 
-    res = requests.post(URL, json=data)
-    print(res.json())
+    try:
+        res = requests.post(URL, json=data)
+        print(f"SENT: {data['server_id']} | CPU: {data['cpu']}% | Memory: {data['memory']}% | Response: {res.json()}")
+    except Exception as e:
+        print(f"ERROR: Could not reach API - {e}")
 
     time.sleep(1)
