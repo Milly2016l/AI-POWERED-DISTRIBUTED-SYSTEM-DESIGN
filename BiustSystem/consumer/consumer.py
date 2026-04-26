@@ -1,11 +1,21 @@
+"""
+BiustSystem/consumer/consumer.py
+==================================
+Kafka consumer that reads metrics from the 'metrics-topic' topic,
+dispatches each message to a Celery worker for async processing,
+and writes every metric to InfluxDB for persistent storage.
+"""
+
 import json
-from kafka import KafkaConsumer
 import sys
 import os
+from kafka import KafkaConsumer
 
-# So consumer can import from workers folder
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from workers.worker import process_metric
+# Allow imports from project root
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from BiustSystem.workers.worker import process_metric
+from BiustSystem.consumer.influx_writer import write_metric
 
 consumer = KafkaConsumer(
     "metrics-topic",
@@ -14,12 +24,17 @@ consumer = KafkaConsumer(
     value_deserializer=lambda v: json.loads(v.decode("utf-8"))
 )
 
-print("Consumer running... waiting for messages")
+print("[CONSUMER] Running... waiting for messages from Kafka")
 
 for message in consumer:
     data = message.value
-    print(f"\n[CONSUMER] Received message from Kafka: {data['server_id']}")
+    server = data.get("server_id", "unknown")
 
-    # Hand off to Celery worker asynchronously
+    print(f"\n[CONSUMER] Received message from Kafka: {server}")
+
+    # 1. Persist to InfluxDB
+    write_metric(data)
+
+    # 2. Hand off to Celery worker asynchronously
     process_metric.delay(data)
-    print(f"[CONSUMER] Dispatched to worker ✅")
+    print(f"[CONSUMER] Dispatched to Celery worker ✅")
