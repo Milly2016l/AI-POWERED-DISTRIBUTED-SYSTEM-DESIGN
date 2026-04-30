@@ -1,21 +1,6 @@
 """
-orchestrator/orchestrator.py
-==============================
-Auto-scaling orchestrator for the BIUST Server Monitoring System.
-
-Polls the FastAPI /predict endpoint every 10 seconds and decides
-whether to spawn or terminate Celery worker processes based on the
-AI-predicted system load.
-
-Scaling rules:
-  - predicted_load > 0.75 for 3 consecutive checks → scale UP
-  - predicted_load < 0.30 for 5 consecutive checks AND workers > 2
-    → scale DOWN
-  - Maximum workers: 6
-  - Minimum workers: 2
-
-Run from project root:
-  python orchestrator/orchestrator.py
+orchestrator.py
+Auto-scaling orchestrator for BIUST Server Monitoring System.
 """
 
 import os
@@ -25,207 +10,293 @@ import subprocess
 import requests
 from datetime import datetime
 
-# ── Settings ────────────────────────────────────────────────────
-API_BASE        = os.getenv("API_BASE", "http://127.0.0.1:8000")
-POLL_INTERVAL   = int(os.getenv("POLL_INTERVAL", "10"))
-SCALE_UP_LOAD   = float(os.getenv("SCALE_UP_LOAD",   "0.75"))
-SCALE_DOWN_LOAD = float(os.getenv("SCALE_DOWN_LOAD", "0.30"))
-SCALE_UP_COUNT  = int(os.getenv("SCALE_UP_COUNT",  "3"))
-SCALE_DOWN_COUNT = int(os.getenv("SCALE_DOWN_COUNT", "5"))
-MAX_WORKERS     = int(os.getenv("MAX_WORKERS", "6"))
-MIN_WORKERS     = int(os.getenv("MIN_WORKERS", "2"))
+API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
-# ── State ────────────────────────────────────────────────────────
-worker_processes = []   # list of subprocess.Popen objects
-worker_count     = 0    # total workers spawned (used for naming)
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
+
+SCALE_UP_LOAD = float(os.getenv("SCALE_UP_LOAD", "0.72"))
+SCALE_DOWN_LOAD = float(os.getenv("SCALE_DOWN_LOAD", "0.45"))
+
+SCALE_UP_COUNT = int(os.getenv("SCALE_UP_COUNT", "3"))
+SCALE_DOWN_COUNT = int(os.getenv("SCALE_DOWN_COUNT", "3"))
+
+BASE_WORKERS = int(os.getenv("BASE_WORKERS", "5"))
+MIN_WORKERS = int(os.getenv("MIN_WORKERS", str(BASE_WORKERS)))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+
+worker_processes = []
+worker_count = 0
+
 consecutive_high = 0
-consecutive_low  = 0
+consecutive_low = 0
 
 
-def log(msg: str) -> None:
-    """Print a timestamped log message."""
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}")
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
 
 
-def post_scaling_event(message: str) -> None:
-    """
-    POST a scaling event to the API so the dashboard can display it.
+def log(message):
+    print(f"[{ts()}] {message}", flush=True)
 
-    Args:
-        message: human-readable description of the scaling action.
-    """
+
+def spawned_count():
+    return len([p for p in worker_processes if p.poll() is None])
+
+
+def total_worker_count():
+    return BASE_WORKERS + spawned_count()
+
+
+def post_event(message):
     try:
         requests.post(
             f"{API_BASE}/scaling/event",
             json={"message": message},
-            timeout=3
+            timeout=2,
         )
-    except Exception as e:
-        log(f"WARNING: Could not post scaling event — {e}")
+    except Exception:
+        pass
 
 
-def get_latest_metrics() -> dict | None:
-    """
-    Fetch the latest metric from the API.
-
-    Returns:
-        The most recent metric dict, or None if unavailable.
-    """
+def report_count():
     try:
-        res = requests.get(f"{API_BASE}/metrics/latest", timeout=3)
-        metrics = res.json().get("metrics", [])
-        return metrics[-1] if metrics else None
-    except Exception as e:
-        log(f"WARNING: Could not fetch metrics — {e}")
-        return None
+        requests.post(
+            f"{API_BASE}/workers/count",
+            json={"count": total_worker_count()},
+            timeout=2,
+        )
+    except Exception:
+        pass
 
 
-def get_prediction(metric: dict) -> float | None:
-    """
-    Call the /predict endpoint with a metric payload.
-
-    Args:
-        metric: dict with cpu_usage, memory_usage, requests, latency.
-
-    Returns:
-        Predicted load float (0.0–1.0), or None on error.
-    """
+def get_latest_load():
     try:
-        payload = {
-            "server_id": metric.get("server_id", "orchestrator"),
-            "cpu":       int(metric.get("cpu_usage",    50)),
-            "memory":    int(metric.get("memory_usage", 50)),
-            "requests":  int(metric.get("requests",    500)),
-            "latency":   int(metric.get("latency",     100)),
-        }
-        res = requests.post(f"{API_BASE}/predict", json=payload, timeout=3)
-        return res.json().get("predicted_load", 0.5)
+        response = requests.get(f"{API_BASE}/workers/status", timeout=3)
+        response.raise_for_status()
+
+        workers = response.json().get("workers", [])
+
+        real_workers = [
+            w for w in workers
+            if not str(w.get("server_id", "")).startswith("orchestrator-")
+        ]
+
+        if not real_workers:
+            return None, None
+
+        loads = [
+            float(w.get("predicted_load", 0)) / 100
+            for w in real_workers
+        ]
+
+        avg_load = sum(loads) / len(loads)
+
+        max_severity = "NORMAL"
+
+        for worker in real_workers:
+            severity = worker.get("severity", "NORMAL")
+
+            if severity == "CRITICAL":
+                max_severity = "CRITICAL"
+                break
+
+            if severity == "HIGH":
+                max_severity = "HIGH"
+
+        return avg_load, max_severity
+
     except Exception as e:
-        log(f"WARNING: Could not get prediction — {e}")
-        return None
+        log(f"WARNING: Could not get load — {e}")
+        return None, None
 
 
-def spawn_worker() -> None:
-    """
-    Spawn a new Celery worker subprocess and register it.
-    """
+def spawn_worker():
     global worker_count
+
     worker_count += 1
-    name = f"worker{worker_count}"
+    name = f"orchestrator-worker-{worker_count}"
+
     cmd = [
-        sys.executable, "-m", "celery",
-        "-A", "BiustSystem.workers.worker",
+        sys.executable,
+        "-m",
+        "celery",
+        "-A",
+        "BiustSystem.workers.worker",
         "worker",
         "--loglevel=info",
-        f"-n", f"{name}@%h"
+        "-n",
+        f"{name}@%h",
     ]
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
     )
+
     worker_processes.append(proc)
-    log(f"[ORCHESTRATOR] Spawned {name} (PID {proc.pid})")
+
+    log(f"[ORCHESTRATOR] Spawned {name} PID={proc.pid}")
+    return name
 
 
-def terminate_worker() -> None:
-    """
-    Terminate the most recently spawned Celery worker.
-    """
-    if not worker_processes:
-        return
-    proc = worker_processes.pop()
-    proc.terminate()
-    log(f"[ORCHESTRATOR] Terminated worker (PID {proc.pid})")
+def terminate_worker():
+    live_workers = [p for p in worker_processes if p.poll() is None]
 
+    if not live_workers:
+        return None
 
-def shutdown_all() -> None:
-    """
-    Cleanly terminate all managed worker processes on exit.
-    """
-    log("[ORCHESTRATOR] Shutting down all workers...")
-    for proc in worker_processes:
+    proc = live_workers[-1]
+
+    try:
         proc.terminate()
-    log(f"[ORCHESTRATOR] {len(worker_processes)} workers terminated. Goodbye.")
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass
+
+    try:
+        worker_processes.remove(proc)
+    except ValueError:
+        pass
+
+    log(f"[ORCHESTRATOR] Terminated worker PID={proc.pid}")
+    return proc.pid
 
 
-def active_worker_count() -> int:
-    """Return number of currently running managed workers."""
-    return len([p for p in worker_processes if p.poll() is None])
+def shutdown_all():
+    log(f"[ORCHESTRATOR] Shutting down {spawned_count()} spawned workers")
+
+    for proc in worker_processes:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+    report_count()
 
 
-# ── Main loop ────────────────────────────────────────────────────
-def main() -> None:
-    """
-    Main orchestrator loop. Runs indefinitely until CTRL+C.
-    """
+def main():
     global consecutive_high, consecutive_low
 
-    log("[ORCHESTRATOR] Starting — polling every 10 seconds")
-    log(f"[ORCHESTRATOR] Scale UP  threshold: load > {SCALE_UP_LOAD} for {SCALE_UP_COUNT} checks")
-    log(f"[ORCHESTRATOR] Scale DOWN threshold: load < {SCALE_DOWN_LOAD} for {SCALE_DOWN_COUNT} checks")
+    log("[ORCHESTRATOR] Starting")
+    log(f"[ORCHESTRATOR] API: {API_BASE}")
+    log(f"[ORCHESTRATOR] Base workers: {BASE_WORKERS}")
+    log(f"[ORCHESTRATOR] Min workers: {MIN_WORKERS}")
+    log(f"[ORCHESTRATOR] Max workers: {MAX_WORKERS}")
+    log(f"[ORCHESTRATOR] Scale up load: {SCALE_UP_LOAD}")
+    log(f"[ORCHESTRATOR] Scale down load: {SCALE_DOWN_LOAD}")
+    log(f"[ORCHESTRATOR] Scale up count: {SCALE_UP_COUNT}")
+    log(f"[ORCHESTRATOR] Scale down count: {SCALE_DOWN_COUNT}")
+
+    report_count()
 
     try:
         while True:
-            metric = get_latest_metrics()
-
-            if metric is None:
-                log("[ORCHESTRATOR] No metrics yet — waiting...")
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            load = get_prediction(metric)
-
-            if load is None:
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            workers_now = active_worker_count()
+            load, severity = get_latest_load()
+            workers_now = total_worker_count()
             action = "none"
 
-            # ── Scale UP logic ──────────────────────────────────
-            if load > SCALE_UP_LOAD:
+            if load is None:
+                log(
+                    f"[ORCHESTRATOR] No load data yet | "
+                    f"Workers: {workers_now}"
+                )
+                report_count()
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if severity == "CRITICAL" and workers_now < MAX_WORKERS:
+                name = spawn_worker()
+                consecutive_high = 0
+                consecutive_low = 0
+                action = "EMERGENCY SCALE UP"
+
+                message = (
+                    f"[ORCHESTRATOR] EMERGENCY SCALE UP — {name} spawned "
+                    f"| Severity: CRITICAL | Load: {load:.3f}"
+                )
+
+                log(message)
+                post_event(message)
+
+            elif load > SCALE_UP_LOAD:
                 consecutive_high += 1
-                consecutive_low   = 0
+                consecutive_low = 0
+
                 if consecutive_high >= SCALE_UP_COUNT and workers_now < MAX_WORKERS:
-                    spawn_worker()
+                    name = spawn_worker()
                     consecutive_high = 0
                     action = "SCALE UP"
-                    msg = (f"[ORCHESTRATOR] Scaling UP — spawning worker-{worker_count} "
-                           f"(predicted load: {load:.3f})")
-                    log(msg)
-                    post_scaling_event(msg)
 
-            # ── Scale DOWN logic ────────────────────────────────
+                    message = (
+                        f"[ORCHESTRATOR] SCALE UP — {name} spawned "
+                        f"| Load: {load:.3f}"
+                    )
+
+                    log(message)
+                    post_event(message)
+
+                else:
+                    log(
+                        f"[ORCHESTRATOR] High load streak "
+                        f"{consecutive_high}/{SCALE_UP_COUNT} "
+                        f"| Load: {load:.3f}"
+                    )
+
             elif load < SCALE_DOWN_LOAD:
-                consecutive_low  += 1
-                consecutive_high  = 0
+                consecutive_low += 1
+                consecutive_high = 0
+
                 if consecutive_low >= SCALE_DOWN_COUNT and workers_now > MIN_WORKERS:
-                    msg = (f"[ORCHESTRATOR] Scaling DOWN — terminating worker "
-                           f"(predicted load: {load:.3f})")
-                    log(msg)
-                    terminate_worker()
+                    pid = terminate_worker()
                     consecutive_low = 0
                     action = "SCALE DOWN"
-                    post_scaling_event(msg)
+
+                    message = (
+                        f"[ORCHESTRATOR] SCALE DOWN — worker PID={pid} removed "
+                        f"| Load: {load:.3f}"
+                    )
+
+                    log(message)
+                    post_event(message)
+
+                else:
+                    if workers_now > MIN_WORKERS:
+                        log(
+                            f"[ORCHESTRATOR] Low load streak "
+                            f"{consecutive_low}/{SCALE_DOWN_COUNT} "
+                            f"| Load: {load:.3f}"
+                        )
+                    else:
+                        log(
+                            f"[ORCHESTRATOR] Low load but already at minimum "
+                            f"workers | Workers: {workers_now}"
+                        )
 
             else:
                 consecutive_high = 0
-                consecutive_low  = 0
+                consecutive_low = 0
+
+            report_count()
 
             log(
-                f"[ORCHESTRATOR] Workers: {active_worker_count()} | "
-                f"Load: {load:.3f} | "
-                f"High streak: {consecutive_high} | "
-                f"Low streak: {consecutive_low} | "
-                f"Action: {action}"
+                f"[ORCHESTRATOR] Workers: {total_worker_count()} "
+                f"| Spawned: {spawned_count()} "
+                f"| AvgLoad: {load:.3f} "
+                f"| Severity: {severity} "
+                f"| HighStreak: {consecutive_high} "
+                f"| LowStreak: {consecutive_low} "
+                f"| Action: {action}"
             )
 
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
         shutdown_all()
+        log("[ORCHESTRATOR] Stopped")
 
 
 if __name__ == "__main__":

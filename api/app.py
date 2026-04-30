@@ -2,6 +2,9 @@
 BIUST Monitoring API — Final Production Version
 =================================================
 Fixes applied:
+- /simulator/scenario  GET/POST  – lets frontend read & set the active scenario
+- /workers/status      returns   – real InfluxDB data + simulated nodes when load is high
+- Orchestrator scaling is reflected in managed_workers and returned in /workers/status
 - worker_count query uses tag-based grouping (fixes schema collision)
 - Model paths are absolute so they work from any working directory
 - /metrics/latest returns consistent {metrics:[...]} shape
@@ -42,13 +45,12 @@ app.add_middleware(
 )
 
 # ── Load AI Model — absolute path so it works from anywhere ─────
-_HERE = os.path.dirname(os.path.abspath(__file__))   # api/
-_ROOT = os.path.dirname(_HERE)                        # project root
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
 
 MODEL_PATH  = os.path.join(_ROOT, "ai", "model", "load_model.pkl")
 SCALER_PATH = os.path.join(_ROOT, "ai", "model", "scaler.pkl")
 
-# Fallback: same folder as app.py (for when pkl files are copied there)
 if not os.path.exists(MODEL_PATH):
     MODEL_PATH  = os.path.join(_HERE, "load_model.pkl")
     SCALER_PATH = os.path.join(_HERE, "scaler.pkl")
@@ -71,6 +73,42 @@ else:
 scaling_events  : list = []
 managed_workers : int  = 0
 
+# Dashboard/test-panel live display tuning
+BASE_WORKERS = int(os.getenv("BASE_WORKERS", "5"))
+ACTIVE_WINDOW_SECONDS = int(os.getenv("ACTIVE_WINDOW_SECONDS", "20"))
+
+# ── Scenario state (shared with simulator via file + API) ────────
+SCENARIO_RANGES = {
+    "normal":   {"cpu": (20, 55),  "memory": (30, 60),  "requests": (80,  200),  "latency": (30,  100)},
+    "peak":     {"cpu": (65, 88),  "memory": (70, 90),  "requests": (400, 900),  "latency": (150, 300)},
+    "critical": {"cpu": (88, 98),  "memory": (85, 96),  "requests": (800, 2000), "latency": (250, 500)},
+    "low":      {"cpu": (5,  20),  "memory": (15, 35),  "requests": (20,  60),   "latency": (15,  50)},
+}
+# Active scenario written to simulator_state.json so client.py picks it up
+STATE_FILE = os.path.join(os.path.dirname(_HERE), "simulator_state.json")
+# Fallback: try project root / current dir
+if not os.path.exists(os.path.dirname(STATE_FILE)):
+    STATE_FILE = "simulator_state.json"
+
+import json as _json
+import time as _time
+
+def _read_state() -> dict:
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return _json.load(f)
+    except Exception:
+        pass
+    return {"scenario": "normal", "burst_until": 0}
+
+def _write_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w") as f:
+            _json.dump(state, f)
+    except Exception as e:
+        print(f"⚠️  Could not write state file: {e}")
+
 # ── Pydantic Models ─────────────────────────────────────────────
 class Metrics(BaseModel):
     server_id: str   = "node-1"
@@ -86,9 +124,12 @@ class ScalingEvent(BaseModel):
 class WorkerCount(BaseModel):
     count: int
 
+class ScenarioRequest(BaseModel):
+    scenario: str
+    burst_seconds: int = 0   # if > 0, force critical for this many seconds
+
 # ── AI Prediction ───────────────────────────────────────────────
 def make_prediction(data: Metrics) -> dict:
-    """Run RandomForest prediction or fall back to heuristic."""
     now     = datetime.now()
     hour    = now.hour
     is_peak = 1 if (8 <= hour <= 17) else 0
@@ -130,7 +171,6 @@ def make_prediction(data: Metrics) -> dict:
 
 # ── InfluxDB helpers ────────────────────────────────────────────
 def run_query(flux: str) -> list:
-    """Execute a Flux query and return flat list of record dicts."""
     try:
         tables = query_api.query(flux, org=INFLUX_ORG)
         return [record.values for table in tables for record in table.records]
@@ -139,12 +179,6 @@ def run_query(flux: str) -> list:
         return []
 
 def count_active_servers() -> int:
-    """
-    Count distinct server_id tags active in the last 10 minutes.
-    Filters to a single field (cpu) BEFORE grouping to avoid the
-    'schema collision: cannot group float and integer types together'
-    error that occurs when mixed field types are grouped together.
-    """
     flux = f"""
     from(bucket: "{INFLUX_BUCKET}")
       |> range(start: -10m)
@@ -163,6 +197,12 @@ def count_active_servers() -> int:
     except Exception as e:
         print(f"⚠️  Worker count query failed: {e}")
     return 1
+
+def _parse_range(range_str, range_mins: int) -> str:
+    if range_str:
+        s = range_str.lstrip("-").strip()
+        return f"-{s}"
+    return f"-{range_mins}m"
 
 # ── Routes ───────────────────────────────────────────────────────
 
@@ -188,9 +228,56 @@ def health():
         "model_type":         "RandomForest (trained)" if model else "Heuristic",
     }
 
+# ── NEW: Scenario endpoints ──────────────────────────────────────
+
+@app.get("/simulator/scenario")
+def get_scenario():
+    """Return the current simulator scenario and its metric ranges."""
+    state    = _read_state()
+    scenario = state.get("scenario", "normal")
+    burst_until = state.get("burst_until", 0)
+    active = "critical" if _time.time() < burst_until else scenario
+    ranges = SCENARIO_RANGES.get(active, SCENARIO_RANGES["normal"])
+    return {
+        "scenario":      scenario,
+        "active":        active,
+        "burst_until":   burst_until,
+        "burst_active":  _time.time() < burst_until,
+        "ranges":        ranges,
+        "all_scenarios": SCENARIO_RANGES,
+    }
+
+@app.post("/simulator/scenario")
+def set_scenario(req: ScenarioRequest):
+    """
+    Set the active simulator scenario.
+    The enhanced client.py reads simulator_state.json every loop and
+    adjusts metric generation accordingly.
+    burst_seconds > 0 forces critical load for that duration (burst mode).
+    """
+    if req.scenario not in SCENARIO_RANGES:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown scenario '{req.scenario}'. "
+                                   f"Valid: {list(SCENARIO_RANGES.keys())}")
+    state = _read_state()
+    state["scenario"] = req.scenario
+    if req.burst_seconds > 0:
+        state["burst_until"] = _time.time() + req.burst_seconds
+    else:
+        state["burst_until"] = 0
+    _write_state(state)
+    ranges = SCENARIO_RANGES.get(req.scenario, SCENARIO_RANGES["normal"])
+    return {
+        "status":        "updated",
+        "scenario":      req.scenario,
+        "burst_seconds": req.burst_seconds,
+        "ranges":        ranges,
+    }
+
+# ── Metrics endpoints ────────────────────────────────────────────
+
 @app.post("/metrics")
 def receive_metrics(data: Metrics):
-    """Receive metric, run AI prediction, write to InfluxDB."""
     pred    = make_prediction(data)
     success = False
     try:
@@ -221,60 +308,74 @@ def receive_metrics(data: Metrics):
 
 @app.post("/predict")
 def predict_post(data: Metrics):
-    """POST prediction used by dashboard and orchestrator."""
     return make_prediction(data)
 
 @app.get("/predict")
 def predict_get(cpu: float = 50, memory: float = 50,
                 requests: int = 500, latency: float = 100):
-    """Quick GET prediction for browser testing."""
     return make_prediction(Metrics(cpu=cpu, memory=memory,
                                    requests=requests, latency=latency))
 
 @app.get("/api/dashboard")
 def dashboard_data():
-    """Main data source for the React dashboard."""
     try:
-        latest_flux = f"""
-        from(bucket: "{INFLUX_BUCKET}")
-          |> range(start: -10m)
-          |> filter(fn: (r) => r._measurement == "server_metrics")
-          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-          |> sort(columns: ["_time"], desc: true)
-          |> limit(n: 1)
-        """
-        rows           = run_query(latest_flux)
-        active_workers = count_active_servers()
+        status_payload = get_workers_status()
+        workers = status_payload.get("workers", [])
+        metric_workers = [w for w in workers if w.get("last_seen")]
 
-        if not rows:
+        if not metric_workers:
             return {
                 "cpu": 0, "memory": 0, "requests": 0, "latency": 0,
-                "predictedLoad": 0, "activeWorkers": active_workers,
-                "workers": [], "events": scaling_events[-5:],
+                "predictedLoad": 0, "peakCpu": 0, "peakMemory": 0,
+                "peakPredictedLoad": 0, "severity": "NORMAL", "status": "Normal",
+                "activeWorkers": len(workers), "workers": workers,
+                "events": scaling_events[-10:],
             }
 
-        latest = rows[0]
+        avg_cpu = sum(float(w.get("cpu", 0)) for w in metric_workers) / len(metric_workers)
+        avg_memory = sum(float(w.get("memory", 0)) for w in metric_workers) / len(metric_workers)
+        avg_latency = sum(float(w.get("latency", 0)) for w in metric_workers) / len(metric_workers)
+        avg_predicted = sum(float(w.get("predicted_load", 0)) for w in metric_workers) / len(metric_workers)
+        total_requests = sum(int(w.get("requests", 0)) for w in metric_workers)
+
+        peak_cpu = max(float(w.get("cpu", 0)) for w in metric_workers)
+        peak_memory = max(float(w.get("memory", 0)) for w in metric_workers)
+        peak_predicted = max(float(w.get("predicted_load", 0)) for w in metric_workers)
+
+        severities = [str(w.get("severity", "NORMAL")).upper() for w in metric_workers]
+        if "CRITICAL" in severities:
+            severity, status = "CRITICAL", "Critical"
+        elif "HIGH" in severities:
+            severity, status = "HIGH", "Warning"
+        else:
+            severity, status = "NORMAL", "Normal"
+
         return {
-            "cpu":           round(float(latest.get("cpu",    0)), 1),
-            "memory":        round(float(latest.get("memory", 0)), 1),
-            "requests":      int(latest.get("requests", 0)),
-            "latency":       round(float(latest.get("latency", 0)), 1),
-            "predictedLoad": round(float(latest.get("predicted_load", 0)) * 100, 1),
-            "activeWorkers": active_workers,
-            "workers":       [],
-            "events":        scaling_events[-5:],
+            "cpu": round(avg_cpu, 1),
+            "memory": round(avg_memory, 1),
+            "requests": total_requests,
+            "latency": round(avg_latency, 1),
+            "predictedLoad": round(avg_predicted, 1),
+            "peakCpu": round(peak_cpu, 1),
+            "peakMemory": round(peak_memory, 1),
+            "peakPredictedLoad": round(peak_predicted, 1),
+            "severity": severity,
+            "status": status,
+            "activeWorkers": len(workers),
+            "workers": workers,
+            "events": scaling_events[-10:],
         }
     except Exception as e:
         print(f"❌ Dashboard API Error: {e}")
         return {
             "cpu": 0, "memory": 0, "requests": 0, "latency": 0,
-            "predictedLoad": 0, "activeWorkers": 1,
-            "workers": [], "events": [], "error": str(e),
+            "predictedLoad": 0, "peakCpu": 0, "peakMemory": 0,
+            "peakPredictedLoad": 0, "severity": "NORMAL", "status": "Offline",
+            "activeWorkers": 0, "workers": [], "events": [], "error": str(e),
         }
 
 @app.get("/metrics/latest")
 def get_latest(limit: int = 20):
-    """Returns recent metrics as {metrics:[...]} for the frontend."""
     flux = f"""
     from(bucket: "{INFLUX_BUCKET}")
       |> range(start: -1h)
@@ -298,19 +399,6 @@ def get_latest(limit: int = 20):
     ]
     return {"metrics": normalised}
 
-def _parse_range(range_str: str | None, range_mins: int) -> str:
-    """
-    Convert either a Flux duration string (e.g. '-1h', '-15m', '-7d')
-    or the legacy range_mins integer into a Flux start expression.
-    Returns a string like '-60m' or '-1h' ready to embed in a query.
-    """
-    if range_str:
-        # Accept '-1h', '1h', '-15m', '-7d' etc.
-        s = range_str.lstrip("-").strip()
-        return f"-{s}"
-    return f"-{range_mins}m"
-
-
 @app.get("/metrics/history")
 def get_history(
     range_mins: int = 60,
@@ -319,13 +407,6 @@ def get_history(
     severity:   str = None,
     limit:      int = 200,
 ):
-    """
-    Returns historical metrics rows from InfluxDB.
-    Accepts either:
-      - range_mins=60      (legacy integer, minutes)
-      - range=-1h          (Flux duration string from the frontend)
-    Optional filters: server_id, severity.
-    """
     start = _parse_range(range, range_mins)
     flux = f"""
     from(bucket: "{INFLUX_BUCKET}")
@@ -358,17 +439,15 @@ def get_history(
     ]
     return {"metrics": normalised, "range_mins": range_mins, "range": start}
 
-
 @app.get("/workers/status")
 def get_workers_status():
     """
-    Returns real per-worker (server_id) stats from InfluxDB.
-    Queries the most recent metric point for every active server_id
-    in the last 10 minutes, so the frontend can display live cards.
+    Returns only live per-server stats from InfluxDB plus current orchestrator
+    standby nodes. Removed orchestrator workers are hidden immediately.
     """
     flux = f"""
     from(bucket: "{INFLUX_BUCKET}")
-      |> range(start: -10m)
+      |> range(start: -{ACTIVE_WINDOW_SECONDS}s)
       |> filter(fn: (r) => r._measurement == "server_metrics")
       |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
       |> group(columns: ["server_id"])
@@ -377,45 +456,79 @@ def get_workers_status():
     """
     rows = run_query(flux)
 
+    allowed_dynamic_workers = max(0, managed_workers - BASE_WORKERS)
     workers = []
+
     for r in rows:
-        cpu     = float(r.get("cpu",    0))
-        memory  = float(r.get("memory", 0))
-        sev     = r.get("severity", "NORMAL")
-        sugg    = r.get("suggestion", "STEADY")
+        server_id = str(r.get("server_id", "unknown"))
+
+        if server_id.startswith("orchestrator-worker-"):
+            try:
+                worker_num = int(server_id.rsplit("-", 1)[1])
+                if worker_num > allowed_dynamic_workers:
+                    continue
+            except Exception:
+                continue
+
+        cpu = float(r.get("cpu", 0))
+        memory = float(r.get("memory", 0))
+        sev = str(r.get("severity", "NORMAL")).upper()
+        sugg = r.get("suggestion", "STEADY")
+
         if sev == "CRITICAL":
             status = "Critical"
         elif sev == "HIGH" or cpu > 70:
             status = "Busy"
         else:
             status = "Active"
+
         workers.append({
-            "server_id":      r.get("server_id", "unknown"),
-            "cpu":            round(cpu, 1),
-            "memory":         round(memory, 1),
-            "requests":       int(r.get("requests", 0)),
-            "latency":        round(float(r.get("latency", 0)), 1),
+            "server_id": server_id,
+            "cpu": round(cpu, 1),
+            "memory": round(memory, 1),
+            "requests": int(r.get("requests", 0)),
+            "latency": round(float(r.get("latency", 0)), 1),
             "predicted_load": round(float(r.get("predicted_load", 0)) * 100, 1),
-            "severity":       sev,
-            "suggestion":     sugg,
-            "status":         status,
-            "last_seen":      str(r.get("_time", "")),
+            "severity": sev,
+            "suggestion": sugg,
+            "status": status,
+            "last_seen": str(r.get("_time", "")),
         })
 
-    # Sort by server_id for stable card order
     workers.sort(key=lambda w: w["server_id"])
-    return {"workers": workers, "count": len(workers)}
 
+    existing_ids = {w["server_id"] for w in workers}
+    missing = max(0, managed_workers - len(workers))
+
+    for i in range(1, missing + 1):
+        sid = f"orchestrator-worker-{i}"
+        if sid not in existing_ids:
+            workers.append({
+                "server_id": sid,
+                "cpu": 0.0,
+                "memory": 0.0,
+                "requests": 0,
+                "latency": 0.0,
+                "predicted_load": 0.0,
+                "severity": "NORMAL",
+                "suggestion": "STEADY",
+                "status": "Standby",
+                "last_seen": "",
+            })
+
+    workers.sort(key=lambda w: w["server_id"])
+    return {
+        "workers": workers,
+        "count": len(workers),
+        "managed_workers": managed_workers,
+        "active_window_seconds": ACTIVE_WINDOW_SECONDS,
+    }
 
 @app.get("/metrics/stats")
 def get_stats(
     range_mins: int = 60,
     range:      str = Query(None, description="Flux duration string, e.g. -1h"),
 ):
-    """
-    Returns per-server aggregated stats (avg CPU, memory, requests, latency,
-    predicted_load, and event count) for the Stats tab in the frontend.
-    """
     start = _parse_range(range, range_mins)
     flux = f"""
     from(bucket: "{INFLUX_BUCKET}")
@@ -429,7 +542,6 @@ def get_stats(
     rows_mean  = run_query(flux + '|> mean()')
     rows_count = run_query(flux + '|> count()')
 
-    # Build nested dict: server_id -> field -> value
     agg: dict = {}
     for r in rows_mean:
         sid   = r.get("server_id", "unknown")
@@ -442,14 +554,13 @@ def get_stats(
     for r in rows_count:
         sid   = r.get("server_id", "unknown")
         field = r.get("_field",    "")
-        if field == "cpu" and sid in agg:          # use cpu count as total events
+        if field == "cpu" and sid in agg:
             agg[sid]["total_events"] = int(r.get("_value", 0))
 
     return {"stats": agg, "range": start}
 
 @app.post("/scaling/event")
 def receive_scaling_event(event: ScalingEvent):
-    """Log a scaling action from the orchestrator."""
     entry = {"timestamp": datetime.utcnow().isoformat(), "message": event.message}
     scaling_events.append(entry)
     if len(scaling_events) > 20:
@@ -459,24 +570,20 @@ def receive_scaling_event(event: ScalingEvent):
 
 @app.get("/scaling/events")
 def get_scaling_events():
-    """Return last 20 orchestrator scaling events."""
     return {"events": scaling_events}
 
 @app.post("/workers/count")
 def update_worker_count(payload: WorkerCount):
-    """Orchestrator reports current worker count."""
     global managed_workers
     managed_workers = payload.count
     return {"status": "updated", "count": managed_workers}
 
 @app.get("/workers/count")
 def get_worker_count():
-    """Return current managed worker count."""
     return {"count": managed_workers}
 
 @app.delete("/metrics/clear")
 def clear_metrics():
-    """Wipe all metrics from InfluxDB — dev use only."""
     try:
         start = datetime(1970, 1, 1, tzinfo=timezone.utc)
         stop  = datetime.now(timezone.utc) + timedelta(seconds=1)
